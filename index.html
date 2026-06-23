@@ -1,0 +1,1102 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Controladoria · Monitor de Compras</title>
+
+  <!-- Tailwind -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Recharts (precisa de React global antes) -->
+  <script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+  <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <!-- Parsers -->
+  <script crossorigin src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
+  <script crossorigin src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+  <!-- Babel para transpilar JSX no navegador -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html, body, #root { height: 100%; margin: 0; }
+    body { background: #0B1929; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/jsx" id="appCode">
+    const { useState, useEffect, useMemo, useRef } = React;
+    const {
+      LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+    } = Recharts;
+    // XLSX e Papa já estão globais via CDN
+
+    /* =====================================================================
+       CONTROLADORIA · MONITOR DE COMPRAS
+       ===================================================================== */
+
+    const C = {
+      bg: "#0B1929",
+      card: "#16181C",
+      border: "rgba(255,255,255,0.07)",
+      text: "#E8E6E1",
+      textSec: "#9A9690",
+      gold: "#C8A96E",
+      green: "#7AB87A",
+      red: "#C87070",
+      yellow: "#C8A640",
+      blue: "#6E9FC8",
+    };
+
+    const KPI_DEFS = [
+      { key: "preco_medio_variacao", nome: "Preço Médio de Compra", unidade: "%", fonte: "Winthor", grupo: "A", decimais: 1 },
+      { key: "variacao_custo_unitario", nome: "Variação de Custo Unitário", unidade: "%", fonte: "Winthor", grupo: "A", decimais: 1 },
+      { key: "volume_recebido_kg", nome: "Volume Recebido", unidade: "kg", fonte: "Winthor", grupo: "A", decimais: 0 },
+      { key: "lead_time_dias", nome: "Lead Time Fornecedor", unidade: "dias", fonte: "Winthor", grupo: "A", decimais: 0 },
+      { key: "pontualidade_pct", nome: "Pontualidade Fornecedores", unidade: "%", fonte: "Winthor", grupo: "A", decimais: 0 },
+      { key: "valor_em_aberto", nome: "Pedidos em Aberto", unidade: "R$", fonte: "Winthor", grupo: "A", decimais: 0 },
+      { key: "concentracao_top5_pct", nome: "Concentração Fornecedores", unidade: "%", fonte: "Winthor", grupo: "A", decimais: 0 },
+      { key: "adiantamentos", nome: "Adiantamentos em Aberto", unidade: "R$", fonte: "Manual", grupo: "B", decimais: 0 },
+      { key: "economias_pct", nome: "Economias Geradas", unidade: "%", fonte: "Manual", grupo: "B", decimais: 1 },
+      { key: "compras_contrato_pct", nome: "% Compras com Contrato", unidade: "%", fonte: "Manual", grupo: "B", decimais: 0 },
+      { key: "urgencia_pct", nome: "Pedidos de Urgência", unidade: "%", fonte: "Manual", grupo: "B", decimais: 0 },
+      { key: "nc_qualidade_pct", nome: "Taxa NC de Qualidade", unidade: "%", fonte: "Manual", grupo: "B", decimais: 1 },
+    ];
+    const KPI_BY_KEY = Object.fromEntries(KPI_DEFS.map((k) => [k.key, k]));
+
+    const MENOR_MELHOR = new Set([
+      "variacao_custo_unitario", "lead_time_dias", "valor_em_aberto",
+      "concentracao_top5_pct", "urgencia_pct", "nc_qualidade_pct", "adiantamentos",
+    ]);
+
+    function semaforo(key, v) {
+      if (v == null || isNaN(v)) return null;
+      switch (key) {
+        case "lead_time_dias": return v <= 15 ? "verde" : v <= 25 ? "amarelo" : "vermelho";
+        case "pontualidade_pct": return v >= 85 ? "verde" : v >= 70 ? "amarelo" : "vermelho";
+        case "concentracao_top5_pct": return v <= 60 ? "verde" : v <= 75 ? "amarelo" : "vermelho";
+        case "urgencia_pct": return v <= 10 ? "verde" : v <= 20 ? "amarelo" : "vermelho";
+        case "nc_qualidade_pct": return v <= 2 ? "verde" : v <= 5 ? "amarelo" : "vermelho";
+        case "variacao_custo_unitario": return v <= 2 ? "verde" : v <= 5 ? "amarelo" : "vermelho";
+        default: return null;
+      }
+    }
+    const SEM_EMOJI = { verde: "🟢", amarelo: "🟡", vermelho: "🔴" };
+
+    function parseNumBR(raw) {
+      if (raw == null) return null;
+      if (typeof raw === "number") return raw;
+      let s = String(raw).trim();
+      if (!s) return null;
+      s = s.replace(/[*R$\s]/g, "");
+      if (s === "" || s === "-") return null;
+      s = s.replace(/\./g, "").replace(",", ".");
+      const n = parseFloat(s);
+      return isNaN(n) ? null : n;
+    }
+
+    function isoWeek(date) {
+      const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+      const dayNum = d.getUTCDay() || 7;
+      d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+      const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+      const weekNo = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+      return { ano: d.getUTCFullYear(), semana: weekNo };
+    }
+    function semanaAtualId() {
+      const { ano, semana } = isoWeek(new Date());
+      return `${ano}-Sem${String(semana).padStart(2, "0")}`;
+    }
+    const MESES = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"];
+
+    function parseDataBR(s) {
+      if (!s) return null;
+      const m = String(s).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+      if (!m) return null;
+      let [, d, mo, y] = m;
+      y = y.length === 2 ? "20" + y : y;
+      const dt = new Date(Number(y), Number(mo) - 1, Number(d));
+      return isNaN(dt) ? null : dt;
+    }
+    function fmtDataBR(dt) {
+      if (!dt) return "";
+      return `${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")}/${dt.getFullYear()}`;
+    }
+    function fmtValor(key, v) {
+      if (v == null || isNaN(v)) return "—";
+      const def = KPI_BY_KEY[key];
+      const dec = def ? def.decimais : 1;
+      if (def && def.unidade === "R$") return "R$ " + v.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
+      if (def && def.unidade === "kg") return v.toLocaleString("pt-BR", { maximumFractionDigits: 0 }) + " kg";
+      const num = v.toLocaleString("pt-BR", { minimumFractionDigits: dec, maximumFractionDigits: dec });
+      return def && def.unidade === "%" ? num + "%" : num;
+    }
+
+    const DADOS_EXEMPLO = {
+      semanas: {
+        "2026-Sem26": {
+          periodo_inicio: "22/06/2026", periodo_fim: "22/06/2026", mes: "Jun",
+          kpis: { preco_medio_variacao: 2.3, variacao_custo_unitario: 1.8, volume_recebido_kg: 42300, lead_time_dias: 18, pontualidade_pct: 78, valor_em_aberto: 181928, concentracao_top5_pct: 65, adiantamentos: 15700000, economias_pct: 4.2, compras_contrato_pct: 56, urgencia_pct: 14, nc_qualidade_pct: 3.1 },
+          fornecedores: [
+            { nome: "L J A COMERCIAL DE ALIMENTOS LTDA", valor: 124367.24, kg: 39420 },
+            { nome: "AGRO INDUSTRIAL SANTA RITA LTDA", valor: 98230.0, kg: 28100 },
+            { nome: "DISTRIBUIDORA NORTE GRÃOS LTDA", valor: 76450.5, kg: 19800 },
+            { nome: "COMERCIAL DE CEREAIS PLANALTO", valor: 54120.0, kg: 14200 },
+            { nome: "ALIMENTOS DO CERRADO EIRELI", valor: 41980.3, kg: 9600 },
+            { nome: "EMBALAGENS UNIÃO LTDA", valor: 22340.0, kg: 3100 },
+          ],
+          fonte_218: "exemplo", fonte_217: "exemplo", atualizado_em: "2026-06-22T20:00:00",
+        },
+        "2026-Sem25": {
+          periodo_inicio: "15/06/2026", periodo_fim: "19/06/2026", mes: "Jun",
+          kpis: { preco_medio_variacao: 1.9, variacao_custo_unitario: 2.1, volume_recebido_kg: 38500, lead_time_dias: 22, pontualidade_pct: 71, valor_em_aberto: 205000, concentracao_top5_pct: 68, adiantamentos: 15700000, economias_pct: 3.8, compras_contrato_pct: 52, urgencia_pct: 18, nc_qualidade_pct: 2.8 },
+          fornecedores: [
+            { nome: "L J A COMERCIAL DE ALIMENTOS LTDA", valor: 118900.0, kg: 36200 },
+            { nome: "AGRO INDUSTRIAL SANTA RITA LTDA", valor: 91500.0, kg: 26400 },
+            { nome: "DISTRIBUIDORA NORTE GRÃOS LTDA", valor: 70110.0, kg: 18200 },
+            { nome: "COMERCIAL DE CEREAIS PLANALTO", valor: 48900.0, kg: 12800 },
+            { nome: "ALIMENTOS DO CERRADO EIRELI", valor: 38200.0, kg: 8900 },
+          ],
+          fonte_218: "exemplo", fonte_217: "exemplo", atualizado_em: "2026-06-19T18:30:00",
+        },
+        "2026-Sem24": {
+          periodo_inicio: "08/06/2026", periodo_fim: "12/06/2026", mes: "Jun",
+          kpis: { preco_medio_variacao: 1.5, variacao_custo_unitario: 1.2, volume_recebido_kg: 40100, lead_time_dias: 16, pontualidade_pct: 82, valor_em_aberto: 168000, concentracao_top5_pct: 62, adiantamentos: 15700000, economias_pct: 5.1, compras_contrato_pct: 58, urgencia_pct: 9, nc_qualidade_pct: 1.9 },
+          fornecedores: [], fonte_218: "exemplo", fonte_217: "exemplo", atualizado_em: "2026-06-12T17:00:00",
+        },
+        "2026-Sem23": {
+          periodo_inicio: "01/06/2026", periodo_fim: "05/06/2026", mes: "Jun",
+          kpis: { preco_medio_variacao: 0.9, variacao_custo_unitario: 0.8, volume_recebido_kg: 35800, lead_time_dias: 14, pontualidade_pct: 88, valor_em_aberto: 152300, concentracao_top5_pct: 59, adiantamentos: 14200000, economias_pct: 6.0, compras_contrato_pct: 61, urgencia_pct: 7, nc_qualidade_pct: 1.4 },
+          fornecedores: [], fonte_218: "exemplo", fonte_217: "exemplo", atualizado_em: "2026-06-05T16:00:00",
+        },
+      },
+      metas: { lead_time_dias: 15, pontualidade_pct: 85, concentracao_top5_pct: 60, urgencia_pct: 10, nc_qualidade_pct: 2, variacao_custo_unitario: 2 },
+    };
+
+    const LS_KEY = "ctrl_compras_v1";
+    function carregarDados() {
+      try {
+        const raw = localStorage.getItem(LS_KEY);
+        if (!raw) { localStorage.setItem(LS_KEY, JSON.stringify(DADOS_EXEMPLO)); return JSON.parse(JSON.stringify(DADOS_EXEMPLO)); }
+        const parsed = JSON.parse(raw);
+        if (!parsed.semanas) parsed.semanas = {};
+        if (!parsed.metas) parsed.metas = DADOS_EXEMPLO.metas;
+        return parsed;
+      } catch (e) { return JSON.parse(JSON.stringify(DADOS_EXEMPLO)); }
+    }
+    function salvarDados(dados) {
+      try { localStorage.setItem(LS_KEY, JSON.stringify(dados)); } catch (e) { console.error(e); }
+    }
+
+    /* ----------------------- SINCRONIZAÇÃO GOOGLE DRIVE (Apps Script) ----------------------- */
+    const DRIVE_URL_KEY = "ctrl_compras_drive_url";
+    // URL do App da Web já implantado na planilha Acompanhamento_Compras_2026 (vem pré-configurada).
+    const DRIVE_URL_PADRAO = "https://script.google.com/macros/s/AKfycbwkpwSwpDFztxfVaoIsBfnsK_btnazn4nWe5hBMoJxgTjnFgHnnROkypMRaPKDxYHewvw/exec";
+    function getDriveUrl() { return localStorage.getItem(DRIVE_URL_KEY) || DRIVE_URL_PADRAO; }
+    function setDriveUrl(url) { localStorage.setItem(DRIVE_URL_KEY, url || ""); }
+
+    // Envia o estado completo para a planilha. POST 'no-cors' (text/plain evita preflight).
+    function enviarDrive(state) {
+      const url = getDriveUrl();
+      if (!url) return Promise.reject(new Error("URL do Drive não configurada"));
+      return fetch(url, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ semanas: state.semanas, metas: state.metas }),
+      });
+    }
+
+    // Lê os dados da planilha via JSONP (contorna CORS do Apps Script para leitura).
+    function carregarDrive() {
+      const url = getDriveUrl();
+      return new Promise((resolve, reject) => {
+        if (!url) return reject(new Error("URL do Drive não configurada"));
+        const cb = "__driveCb_" + Math.floor(performance.now()).toString(36);
+        const sep = url.indexOf("?") === -1 ? "?" : "&";
+        const script = document.createElement("script");
+        const limpar = () => { delete window[cb]; if (script.parentNode) script.parentNode.removeChild(script); };
+        window[cb] = (data) => { limpar(); resolve(data); };
+        script.onerror = () => { limpar(); reject(new Error("Falha ao carregar do Drive")); };
+        script.src = url + sep + "callback=" + cb + "&t=" + Math.floor(performance.now());
+        document.body.appendChild(script);
+        setTimeout(() => { if (window[cb]) { limpar(); reject(new Error("Tempo esgotado ao carregar do Drive")); } }, 15000);
+      });
+    }
+
+    function ordenarSemanas(semanasObj) {
+      return Object.keys(semanasObj).sort((a, b) => {
+        const pa = a.match(/(\d+)-Sem(\d+)/), pb = b.match(/(\d+)-Sem(\d+)/);
+        if (!pa || !pb) return a.localeCompare(b);
+        return (Number(pa[1]) * 100 + Number(pa[2])) - (Number(pb[1]) * 100 + Number(pb[2]));
+      });
+    }
+
+    /* ----------------------- PARSERS ----------------------- */
+    function lerArquivo(file) {
+      return new Promise((resolve, reject) => {
+        const nome = file.name.toLowerCase();
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("Falha ao ler o arquivo."));
+        if (nome.endsWith(".csv")) {
+          reader.onload = (e) => {
+            const res = Papa.parse(e.target.result, { skipEmptyLines: false });
+            resolve(res.data.map((row) => row.map((c) => (c == null ? "" : String(c)))));
+          };
+          reader.readAsText(file, "ISO-8859-1");
+        } else {
+          reader.onload = (e) => {
+            try {
+              const data = new Uint8Array(e.target.result);
+              const wb = XLSX.read(data, { type: "array" });
+              const ws = wb.Sheets[wb.SheetNames[0]];
+              const json = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+              resolve(json.map((row) => row.map((c) => (c == null ? "" : String(c)))));
+            } catch (err) { reject(new Error("Formato de Excel inválido.")); }
+          };
+          reader.readAsArrayBuffer(file);
+        }
+      });
+    }
+    function acharHeader(rows, palavras) {
+      for (let i = 0; i < Math.min(rows.length, 40); i++) {
+        const txt = rows[i].map((c) => String(c).toLowerCase()).join(" | ");
+        if (palavras.filter((p) => txt.includes(p.toLowerCase())).length >= 2) return i;
+      }
+      return -1;
+    }
+    function mapColunas(headerRow, mapa) {
+      const idx = {};
+      headerRow.forEach((cell, i) => {
+        const c = String(cell).toLowerCase().trim();
+        for (const [campo, termos] of Object.entries(mapa)) {
+          if (idx[campo] != null) continue;
+          if (termos.some((t) => c.includes(t))) idx[campo] = i;
+        }
+      });
+      return idx;
+    }
+
+    function parse218(rows) {
+      const erros = [];
+      const headerIdx = acharHeader(rows, ["peso", "descri", "vl. entrada", "vl entrada", "c.fin", "ct fin"]);
+      if (headerIdx === -1) return { ok: false, erro: "Não encontrei o cabeçalho do relatório 218 (esperava colunas como 'Peso (Kg)', 'Descrição', 'Vl. Entrada')." };
+      const header = rows[headerIdx];
+      const col = mapColunas(header, {
+        data: ["data"], codigo: ["codigo", "código"], descricao: ["descri"], peso: ["peso"],
+        ctFinAnt: ["ct fin.ant", "ct fin ant", "c.fin.ant", "custo fin. anterior", "fin.ant"],
+        cFinAtual: ["c.fin. atual", "c.fin atual", "custo fin. atual", "fin. atual", "c. fin"],
+        vlEntrada: ["vl. entrada", "vl entrada", "vlr entrada"],
+      });
+      if (col.peso == null) erros.push("Coluna 'Peso (Kg)' não encontrada — verifique se exportou o relatório 218 corretamente.");
+      if (col.vlEntrada == null) erros.push("Coluna 'Vl. Entrada' não encontrada no relatório 218.");
+      if (erros.length) return { ok: false, erro: erros.join(" ") };
+
+      const fornecedores = {};
+      let fornecedorAtual = "(sem fornecedor)";
+      let totalKg = 0, totalEntrada = 0, qtdEntradas = 0;
+      const variacoesCusto = [], racioCusto = [];
+      let dataMin = null, dataMax = null;
+      const reFornPrefix = /fornecedor[:\s]/i;
+      const reFornCod = /^\*?(\d{3,6})\s+(.+)/;
+
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row || row.every((c) => String(c).trim() === "")) continue;
+        const primeira = String(row[0] || "").trim();
+        const linhaToda = row.map((c) => String(c)).join(" ").trim();
+
+        if (reFornPrefix.test(linhaToda)) {
+          const m = linhaToda.match(/fornecedor[:\s]+(.+)/i);
+          if (m) {
+            let nome = m[1].trim().split(/prazo entrega/i)[0].trim();
+            const mc = nome.match(reFornCod);
+            fornecedorAtual = mc ? mc[2].trim() : nome;
+            if (!fornecedores[fornecedorAtual]) fornecedores[fornecedorAtual] = { valor: 0, kg: 0 };
+          }
+          continue;
+        }
+        const temData = parseDataBR(col.data != null ? row[col.data] : primeira);
+        const mc2 = primeira.match(reFornCod);
+        if (mc2 && !temData && isNaN(parseNumBR(row[col.peso]))) {
+          fornecedorAtual = mc2[2].trim();
+          if (!fornecedores[fornecedorAtual]) fornecedores[fornecedorAtual] = { valor: 0, kg: 0 };
+          continue;
+        }
+        if (/^(total|subtotal|t o t a l)/i.test(primeira)) continue;
+
+        const peso = parseNumBR(row[col.peso]);
+        const vlEntrada = parseNumBR(row[col.vlEntrada]);
+        if (peso == null && vlEntrada == null) continue;
+
+        qtdEntradas++;
+        if (peso != null) totalKg += peso;
+        if (vlEntrada != null) {
+          totalEntrada += vlEntrada;
+          if (!fornecedores[fornecedorAtual]) fornecedores[fornecedorAtual] = { valor: 0, kg: 0 };
+          fornecedores[fornecedorAtual].valor += vlEntrada;
+          if (peso != null) fornecedores[fornecedorAtual].kg += peso;
+        }
+        const ant = col.ctFinAnt != null ? parseNumBR(row[col.ctFinAnt]) : null;
+        const atual = col.cFinAtual != null ? parseNumBR(row[col.cFinAtual]) : null;
+        if (ant != null && atual != null && ant > 0) {
+          variacoesCusto.push(((atual - ant) / ant) * 100);
+          racioCusto.push((atual / ant) * 100);
+        }
+        if (temData) {
+          if (!dataMin || temData < dataMin) dataMin = temData;
+          if (!dataMax || temData > dataMax) dataMax = temData;
+        }
+      }
+      const listaForn = Object.entries(fornecedores)
+        .map(([nome, v]) => ({ nome, valor: v.valor, kg: v.kg }))
+        .filter((f) => f.valor > 0 || f.kg > 0)
+        .sort((a, b) => b.valor - a.valor);
+      const top5 = listaForn.slice(0, 5).reduce((s, f) => s + f.valor, 0);
+      const concentracao = totalEntrada > 0 ? (top5 / totalEntrada) * 100 : null;
+      const media = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+
+      return {
+        ok: true,
+        kpis: {
+          volume_recebido_kg: Math.round(totalKg),
+          variacao_custo_unitario: media(variacoesCusto) != null ? +media(variacoesCusto).toFixed(2) : null,
+          preco_medio_variacao: media(racioCusto) != null ? +(media(racioCusto) - 100).toFixed(2) : null,
+          concentracao_top5_pct: concentracao != null ? +concentracao.toFixed(1) : null,
+        },
+        fornecedores: listaForn,
+        resumo: { qtdFornecedores: listaForn.length, qtdEntradas, dataMin, dataMax },
+      };
+    }
+
+    function parse217(rows) {
+      const headerIdx = acharHeader(rows, ["saldo pend", "vl.total", "vl total", "dias p/ent", "dt.prev", "fornecedor"]);
+      if (headerIdx === -1) return { ok: false, erro: "Não encontrei o cabeçalho do relatório 217 (esperava colunas como 'Vl.Saldo Pend.', 'Dias p/Ent.')." };
+      const header = rows[headerIdx];
+      const col = mapColunas(header, {
+        fornecedor: ["fornecedor"], dtEmissao: ["dt.emiss", "dt emiss", "emiss"],
+        vlTotal: ["vl.total", "vl total"], vlEntregue: ["vl.entreg", "vl entreg", "entregue"],
+        vlSaldo: ["saldo pend", "vl.saldo", "vl saldo"], dtPrev: ["dt.prev", "prev.ent", "prev ent"],
+        dias: ["dias p/ent", "dias p/ ent", "dias p ent", "dias"],
+      });
+      if (col.vlSaldo == null) return { ok: false, erro: "Coluna 'Vl.Saldo Pend.' não encontrada — verifique se exportou o relatório 217 corretamente." };
+
+      let totalSaldo = 0, totalPedidos = 0, pedidosCompletos = 0;
+      const leadTimes = [];
+      const fornecedores = {};
+      let fornecedorAtual = "(sem fornecedor)";
+      let dataMin = null, dataMax = null;
+      const reFornCod = /^\*?(\d{3,6})\s+(.+)/;
+
+      for (let i = headerIdx + 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row || row.every((c) => String(c).trim() === "")) continue;
+        const primeira = String(row[0] || "").trim();
+        const linhaToda = row.map((c) => String(c)).join(" ").trim();
+        if (/^(total|subtotal|t o t a l)/i.test(primeira)) continue;
+
+        if (/fornecedor[:\s]/i.test(linhaToda) && col.fornecedor == null) {
+          const m = linhaToda.match(/fornecedor[:\s]+(.+)/i);
+          if (m) { const mc = m[1].trim().match(reFornCod); fornecedorAtual = mc ? mc[2].trim() : m[1].trim(); }
+          continue;
+        }
+        const saldo = parseNumBR(row[col.vlSaldo]);
+        const vlTotal = col.vlTotal != null ? parseNumBR(row[col.vlTotal]) : null;
+        if (saldo == null && vlTotal == null) continue;
+
+        let forn = fornecedorAtual;
+        if (col.fornecedor != null) {
+          const fv = String(row[col.fornecedor] || "").trim();
+          if (fv) { const mc = fv.match(reFornCod); forn = mc ? mc[2].trim() : fv; }
+        }
+        if (!fornecedores[forn]) fornecedores[forn] = { leadTimes: [], completos: 0, total: 0 };
+
+        totalPedidos++; fornecedores[forn].total++;
+        if (saldo != null) totalSaldo += saldo;
+        if (saldo != null && Math.abs(saldo) < 0.01) { pedidosCompletos++; fornecedores[forn].completos++; }
+
+        let dias = col.dias != null ? parseNumBR(row[col.dias]) : null;
+        if (dias == null && col.dtEmissao != null && col.dtPrev != null) {
+          const de = parseDataBR(row[col.dtEmissao]), dp = parseDataBR(row[col.dtPrev]);
+          if (de && dp) dias = Math.round((dp - de) / 86400000);
+        }
+        if (dias != null && dias >= 0) { leadTimes.push(dias); fornecedores[forn].leadTimes.push(dias); }
+
+        const de = col.dtEmissao != null ? parseDataBR(row[col.dtEmissao]) : null;
+        if (de) { if (!dataMin || de < dataMin) dataMin = de; if (!dataMax || de > dataMax) dataMax = de; }
+      }
+      const media = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+      const leadMedia = media(leadTimes);
+      const pontualidade = totalPedidos > 0 ? (pedidosCompletos / totalPedidos) * 100 : null;
+      const fornInfo = Object.entries(fornecedores).map(([nome, v]) => ({
+        nome,
+        leadMedio: v.leadTimes.length ? +media(v.leadTimes).toFixed(0) : null,
+        pontualidade: v.total ? +((v.completos / v.total) * 100).toFixed(0) : null,
+      }));
+      return {
+        ok: true,
+        kpis: {
+          lead_time_dias: leadMedia != null ? Math.round(leadMedia) : null,
+          pontualidade_pct: pontualidade != null ? Math.round(pontualidade) : null,
+          valor_em_aberto: Math.round(totalSaldo),
+        },
+        fornecedores: fornInfo,
+        resumo: { qtdPedidos: totalPedidos, dataMin, dataMax },
+      };
+    }
+
+    /* ----------------------- UI ----------------------- */
+    function Toast({ msg }) {
+      if (!msg) return null;
+      return (
+        <div className="fixed bottom-6 right-6 z-50 px-5 py-3 rounded-lg shadow-2xl text-sm font-medium"
+          style={{ background: C.card, color: C.green, border: `1px solid ${C.border}`, fontFamily: "'DM Sans', sans-serif", animation: "fadeIn 0.2s ease" }}>
+          {msg}
+        </div>
+      );
+    }
+
+    function KpiCard({ def, valor, anterior, selecionado, onClick }) {
+      const sem = semaforo(def.key, valor);
+      let varTxt = null, varCor = C.textSec;
+      if (valor != null && anterior != null && !isNaN(anterior) && anterior !== 0) {
+        const delta = valor - anterior;
+        const pctDelta = (delta / Math.abs(anterior)) * 100;
+        const melhorou = MENOR_MELHOR.has(def.key) ? delta < 0 : delta > 0;
+        if (Math.abs(delta) > 1e-9) {
+          varCor = melhorou ? C.green : C.red;
+          varTxt = `${delta > 0 ? "▲" : "▼"} ${Math.abs(pctDelta).toFixed(1)}%`;
+        } else varTxt = "= 0,0%";
+      }
+      return (
+        <button onClick={onClick}
+          className="text-left rounded-xl p-4 transition-all duration-150 relative"
+          style={{ background: C.card, border: `1px solid ${selecionado ? C.gold : C.border}`, boxShadow: selecionado ? `0 0 0 1px ${C.gold}` : "none", fontFamily: "'DM Sans', sans-serif" }}
+          onMouseEnter={(e) => { if (!selecionado) e.currentTarget.style.borderColor = "rgba(200,169,110,0.5)"; e.currentTarget.style.transform = "translateY(-2px)"; }}
+          onMouseLeave={(e) => { if (!selecionado) e.currentTarget.style.borderColor = C.border; e.currentTarget.style.transform = "translateY(0)"; }}>
+          <div className="flex items-start justify-between mb-2">
+            <span className="text-xs leading-tight pr-2" style={{ color: C.textSec }}>{def.nome}</span>
+            <span className="text-[9px] px-1.5 py-0.5 rounded whitespace-nowrap"
+              style={{ color: def.fonte === "Winthor" ? C.blue : C.gold, border: `1px solid ${def.fonte === "Winthor" ? "rgba(110,159,200,0.3)" : "rgba(200,169,110,0.3)"}` }}>
+              {def.fonte}
+            </span>
+          </div>
+          <div className="flex items-center justify-center gap-2 my-3">
+            <span className="text-2xl font-semibold tracking-tight" style={{ color: C.text, fontFamily: "'DM Mono', monospace" }}>
+              {fmtValor(def.key, valor)}
+            </span>
+          </div>
+          <div className="flex items-center justify-between mt-2">
+            <span className="text-xs font-medium" style={{ color: varCor, fontFamily: "'DM Mono', monospace" }}>{varTxt || "—"}</span>
+            <span className="text-sm">{sem ? SEM_EMOJI[sem] : "  "}</span>
+          </div>
+        </button>
+      );
+    }
+
+    function GraficoEvolucao({ dados, kpiKey }) {
+      const def = KPI_BY_KEY[kpiKey];
+      const semanas = ordenarSemanas(dados.semanas).slice(-8);
+      const series = semanas.map((sid) => ({
+        semana: sid.replace(/\d+-Sem/, "S"),
+        valor: dados.semanas[sid].kpis ? dados.semanas[sid].kpis[kpiKey] : null,
+      }));
+      return (
+        <div className="rounded-xl p-5" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-medium" style={{ color: C.text, fontFamily: "'DM Sans', sans-serif" }}>
+              Evolução · {def.nome} <span style={{ color: C.textSec }}>({def.unidade})</span>
+            </h3>
+            <span className="text-xs" style={{ color: C.textSec }}>Últimas {series.length} semanas</span>
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={series} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+              <XAxis dataKey="semana" stroke={C.textSec} tick={{ fontSize: 12, fontFamily: "DM Mono" }} />
+              <YAxis stroke={C.textSec} tick={{ fontSize: 11, fontFamily: "DM Mono" }} width={55} />
+              <Tooltip contentStyle={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text }}
+                labelStyle={{ color: C.gold }} formatter={(v) => [fmtValor(kpiKey, v), def.nome]} />
+              <Line type="monotone" dataKey="valor" stroke={C.gold} strokeWidth={2.5} dot={{ fill: C.gold, r: 4 }} activeDot={{ r: 6 }} animationDuration={600} connectNulls />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      );
+    }
+
+    function Dashboard({ dados, onAtualizar }) {
+      const semanas = ordenarSemanas(dados.semanas);
+      const ultimaId = semanas[semanas.length - 1];
+      const penultimaId = semanas[semanas.length - 2];
+      const ultima = ultimaId ? dados.semanas[ultimaId] : null;
+      const penultima = penultimaId ? dados.semanas[penultimaId] : null;
+      const [kpiSel, setKpiSel] = useState("lead_time_dias");
+      let diasSemDado = null;
+      if (ultima && ultima.atualizado_em) diasSemDado = Math.floor((new Date() - new Date(ultima.atualizado_em)) / 86400000);
+      const alerta = diasSemDado != null && diasSemDado > 8;
+
+      if (!ultima) {
+        return (
+          <div className="flex flex-col items-center justify-center h-full text-center gap-4">
+            <p style={{ color: C.textSec }}>Nenhum dado registrado ainda.</p>
+            <button onClick={onAtualizar} className="px-5 py-2.5 rounded-lg font-medium" style={{ background: C.gold, color: C.bg }}>📤 Atualizar dados</button>
+          </div>
+        );
+      }
+      return (
+        <div className="p-6 overflow-y-auto h-full">
+          <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
+            <div>
+              <h1 className="text-xl font-semibold" style={{ color: C.text, fontFamily: "'DM Sans', sans-serif" }}>Dashboard de Compras</h1>
+              <p className="text-sm mt-1" style={{ color: C.textSec, fontFamily: "'DM Mono', monospace" }}>
+                {ultimaId.replace(/(\d+)-Sem(\d+)/, "Semana $2 · $1")}
+                {ultima.periodo_inicio ? ` · ${ultima.periodo_inicio}${ultima.periodo_fim && ultima.periodo_fim !== ultima.periodo_inicio ? " a " + ultima.periodo_fim : ""}` : ""}
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              {alerta && (
+                <span className="px-3 py-1.5 rounded-lg text-xs font-medium animate-pulse"
+                  style={{ background: "rgba(200,112,112,0.15)", color: C.red, border: `1px solid ${C.red}` }}>
+                  ⚠ {Math.floor(diasSemDado / 7)} semana(s) sem dado ({diasSemDado}d)
+                </span>
+              )}
+              <button onClick={onAtualizar} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ background: C.gold, color: C.bg }}
+                onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.85")} onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}>
+                📤 Atualizar dados
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 mb-6">
+            {KPI_DEFS.map((def) => (
+              <KpiCard key={def.key} def={def}
+                valor={ultima.kpis ? ultima.kpis[def.key] : null}
+                anterior={penultima && penultima.kpis ? penultima.kpis[def.key] : null}
+                selecionado={kpiSel === def.key} onClick={() => setKpiSel(def.key)} />
+            ))}
+          </div>
+          <GraficoEvolucao dados={dados} kpiKey={kpiSel} />
+        </div>
+      );
+    }
+
+    function DropZone({ titulo, sub, onFile, resultado, processando }) {
+      const inputRef = useRef(null);
+      const [hover, setHover] = useState(false);
+      return (
+        <div onDragOver={(e) => { e.preventDefault(); setHover(true); }}
+          onDragLeave={() => setHover(false)}
+          onDrop={(e) => { e.preventDefault(); setHover(false); if (e.dataTransfer.files && e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]); }}
+          onClick={() => inputRef.current && inputRef.current.click()}
+          className="rounded-xl p-6 cursor-pointer transition-all text-center relative"
+          style={{ background: hover ? "rgba(200,169,110,0.08)" : C.card, border: `1.5px dashed ${hover ? C.gold : C.border}` }}>
+          <input ref={inputRef} type="file" accept=".xlsx,.csv" className="hidden" onChange={(e) => e.target.files[0] && onFile(e.target.files[0])} />
+          <div className="text-2xl mb-2">📄</div>
+          <p className="text-sm font-medium mb-1" style={{ color: C.text }}>{titulo}</p>
+          <p className="text-xs" style={{ color: C.textSec }}>{sub}</p>
+          {processando && (
+            <div className="mt-3 text-xs flex items-center justify-center gap-2" style={{ color: C.gold }}>
+              <span className="inline-block w-3 h-3 border-2 rounded-full animate-spin" style={{ borderColor: C.gold, borderTopColor: "transparent" }} />
+              Processando...
+            </div>
+          )}
+          {resultado && resultado.ok && (
+            <div className="mt-3 text-xs px-3 py-2 rounded-lg text-left" style={{ background: "rgba(122,184,122,0.1)", color: C.green }}>✓ {resultado.msg}</div>
+          )}
+          {resultado && !resultado.ok && (
+            <div className="mt-3 text-xs px-3 py-2 rounded-lg text-left" style={{ background: "rgba(200,112,112,0.1)", color: C.red }}>✗ {resultado.erro}</div>
+          )}
+        </div>
+      );
+    }
+
+    function ModalAtualizacao({ dados, onClose, onSalvar, toast }) {
+      const [aba, setAba] = useState("upload");
+      const [proc218, setProc218] = useState(false);
+      const [proc217, setProc217] = useState(false);
+      const [res218, setRes218] = useState(null);
+      const [res217, setRes217] = useState(null);
+      const [parsed218, setParsed218] = useState(null);
+      const [parsed217, setParsed217] = useState(null);
+      const [semanaUpload, setSemanaUpload] = useState(semanaAtualId());
+      const [periodoIni, setPeriodoIni] = useState("");
+      const [periodoFim, setPeriodoFim] = useState("");
+
+      function aplicarPeriodo(resumo) {
+        if (resumo && resumo.dataMin && resumo.dataMax) {
+          setPeriodoIni(fmtDataBR(resumo.dataMin));
+          setPeriodoFim(fmtDataBR(resumo.dataMax));
+          const { ano, semana } = isoWeek(resumo.dataMax);
+          setSemanaUpload(`${ano}-Sem${String(semana).padStart(2, "0")}`);
+        }
+      }
+      async function processar(file, tipo) {
+        if (tipo === "218") { setProc218(true); setRes218(null); } else { setProc217(true); setRes217(null); }
+        try {
+          const rows = await lerArquivo(file);
+          const r = tipo === "218" ? parse218(rows) : parse217(rows);
+          if (!r.ok) {
+            if (tipo === "218") setRes218({ ok: false, erro: r.erro }); else setRes217({ ok: false, erro: r.erro });
+          } else {
+            const per = r.resumo.dataMin && r.resumo.dataMax ? `período ${fmtDataBR(r.resumo.dataMin)} a ${fmtDataBR(r.resumo.dataMax)}` : "período não detectado";
+            if (tipo === "218") { setRes218({ ok: true, msg: `Encontrei ${r.resumo.qtdFornecedores} fornecedores, ${r.resumo.qtdEntradas} entradas, ${per}` }); setParsed218(r); }
+            else { setRes217({ ok: true, msg: `Encontrei ${r.resumo.qtdPedidos} pedidos pendentes, ${per}` }); setParsed217(r); }
+            aplicarPeriodo(r.resumo);
+          }
+        } catch (err) {
+          const msg = "Erro ao ler o arquivo: " + err.message;
+          if (tipo === "218") setRes218({ ok: false, erro: msg }); else setRes217({ ok: false, erro: msg });
+        } finally {
+          if (tipo === "218") setProc218(false); else setProc217(false);
+        }
+      }
+      function confirmarUpload() {
+        if (!parsed218 && !parsed217) return;
+        const fornMap = {};
+        if (parsed218) parsed218.fornecedores.forEach((f) => { fornMap[f.nome] = { nome: f.nome, valor: f.valor, kg: f.kg }; });
+        if (parsed217) parsed217.fornecedores.forEach((f) => {
+          if (!fornMap[f.nome]) fornMap[f.nome] = { nome: f.nome, valor: 0, kg: 0 };
+          fornMap[f.nome].leadMedio = f.leadMedio; fornMap[f.nome].pontualidade = f.pontualidade;
+        });
+        const fornecedores = Object.values(fornMap).sort((a, b) => b.valor - a.valor);
+        const kpisNovos = { ...(parsed218 ? parsed218.kpis : {}), ...(parsed217 ? parsed217.kpis : {}) };
+        onSalvar(semanaUpload, {
+          kpis: kpisNovos, fornecedores, periodo_inicio: periodoIni, periodo_fim: periodoFim,
+          fonte_218: parsed218 ? "upload" : undefined, fonte_217: parsed217 ? "upload" : undefined,
+        });
+        toast(`✓ Dados Winthor da ${semanaUpload.replace(/\d+-Sem/, "Sem ")} salvos`);
+        onClose();
+      }
+
+      const semanaInicial = semanaAtualId();
+      const [manSemana, setManSemana] = useState(semanaInicial);
+      const [man, setMan] = useState({ adiantamentos: "", economias_pct: "", compras_contrato_pct: "", urgencia_pct: "", nc_qualidade_pct: "" });
+      useEffect(() => {
+        const s = dados.semanas[manSemana];
+        if (s && s.kpis) setMan({
+          adiantamentos: s.kpis.adiantamentos ?? "", economias_pct: s.kpis.economias_pct ?? "",
+          compras_contrato_pct: s.kpis.compras_contrato_pct ?? "", urgencia_pct: s.kpis.urgencia_pct ?? "",
+          nc_qualidade_pct: s.kpis.nc_qualidade_pct ?? "",
+        });
+        else setMan({ adiantamentos: "", economias_pct: "", compras_contrato_pct: "", urgencia_pct: "", nc_qualidade_pct: "" });
+      }, [manSemana]);
+      function salvarManual() {
+        const kpis = {};
+        Object.entries(man).forEach(([k, v]) => { kpis[k] = v === "" || v == null ? null : parseFloat(String(v).replace(",", ".")); });
+        onSalvar(manSemana, { kpis });
+        toast(`✓ Dados manuais da ${manSemana.replace(/\d+-Sem/, "Sem ")} salvos`);
+        onClose();
+      }
+      const { ano } = isoWeek(new Date());
+      const opcoesSemana = [];
+      for (let i = 1; i <= 53; i++) opcoesSemana.push(`${ano}-Sem${String(i).padStart(2, "0")}`);
+
+      const campoManual = (label, key, prefixo) => (
+        <div>
+          <label className="text-xs block mb-1.5" style={{ color: C.textSec }}>{label}</label>
+          <div className="flex items-center rounded-lg overflow-hidden" style={{ border: `1px solid ${C.border}`, background: C.bg }}>
+            {prefixo && <span className="px-3 text-sm" style={{ color: C.textSec, fontFamily: "'DM Mono', monospace" }}>{prefixo}</span>}
+            <input type="number" step="any" value={man[key]} onChange={(e) => setMan({ ...man, [key]: e.target.value })}
+              className="flex-1 bg-transparent px-3 py-2.5 outline-none text-sm" style={{ color: C.text, fontFamily: "'DM Mono', monospace" }} placeholder="0" />
+          </div>
+        </div>
+      );
+
+      return (
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.6)" }} onClick={onClose}>
+          <div className="rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto" style={{ background: C.bg, border: `1px solid ${C.border}`, fontFamily: "'DM Sans', sans-serif" }} onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-5" style={{ borderBottom: `1px solid ${C.border}` }}>
+              <h2 className="text-lg font-semibold" style={{ color: C.text }}>Atualização de Dados</h2>
+              <button onClick={onClose} className="text-xl px-2" style={{ color: C.textSec }}>✕</button>
+            </div>
+            <div className="flex gap-1 p-2" style={{ borderBottom: `1px solid ${C.border}` }}>
+              {[["upload", "📤 Upload Winthor"], ["manual", "✏️ Entrada Manual"]].map(([k, l]) => (
+                <button key={k} onClick={() => setAba(k)} className="px-4 py-2 rounded-lg text-sm font-medium"
+                  style={{ background: aba === k ? C.card : "transparent", color: aba === k ? C.gold : C.textSec, border: aba === k ? `1px solid ${C.border}` : "1px solid transparent" }}>
+                  {l}
+                </button>
+              ))}
+            </div>
+            <div className="p-5">
+              {aba === "upload" ? (
+                <div className="space-y-4">
+                  <DropZone titulo="Relatório 218 — Entradas de Mercadoria" sub="Arraste o .xlsx/.csv ou clique para selecionar" onFile={(f) => processar(f, "218")} resultado={res218} processando={proc218} />
+                  <DropZone titulo="Relatório 217 — Pedidos Pendentes" sub="Arraste o .xlsx/.csv ou clique para selecionar" onFile={(f) => processar(f, "217")} resultado={res217} processando={proc217} />
+                  {(res218?.ok || res217?.ok) && (
+                    <div className="rounded-xl p-4 space-y-3" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+                      <div className="grid grid-cols-3 gap-3">
+                        <div>
+                          <label className="text-xs block mb-1" style={{ color: C.textSec }}>Semana</label>
+                          <select value={semanaUpload} onChange={(e) => setSemanaUpload(e.target.value)} className="w-full px-2 py-2 rounded-lg text-sm outline-none" style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}` }}>
+                            {opcoesSemana.map((s) => <option key={s} value={s}>{s.replace(/\d+-Sem/, "Sem ")}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-xs block mb-1" style={{ color: C.textSec }}>Início</label>
+                          <input value={periodoIni} onChange={(e) => setPeriodoIni(e.target.value)} placeholder="DD/MM/AAAA" className="w-full px-2 py-2 rounded-lg text-sm outline-none" style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, fontFamily: "'DM Mono', monospace" }} />
+                        </div>
+                        <div>
+                          <label className="text-xs block mb-1" style={{ color: C.textSec }}>Fim</label>
+                          <input value={periodoFim} onChange={(e) => setPeriodoFim(e.target.value)} placeholder="DD/MM/AAAA" className="w-full px-2 py-2 rounded-lg text-sm outline-none" style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, fontFamily: "'DM Mono', monospace" }} />
+                        </div>
+                      </div>
+                      <button onClick={confirmarUpload} className="w-full py-2.5 rounded-lg font-medium text-sm" style={{ background: C.green, color: C.bg }}>✓ Confirmar e salvar</button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-xs block mb-1.5" style={{ color: C.textSec }}>Semana de referência</label>
+                    <select value={manSemana} onChange={(e) => setManSemana(e.target.value)} className="w-full px-3 py-2.5 rounded-lg text-sm outline-none" style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}` }}>
+                      {opcoesSemana.map((s) => <option key={s} value={s}>{s.replace(/\d+-Sem/, "Semana ")}</option>)}
+                    </select>
+                  </div>
+                  {campoManual("Adiantamentos a Fornecedores em Aberto (R$)", "adiantamentos", "R$")}
+                  {campoManual("Economias Geradas em Compras (%)", "economias_pct", "%")}
+                  {campoManual("% Compras com Contrato", "compras_contrato_pct", "%")}
+                  {campoManual("Pedidos de Urgência (%)", "urgencia_pct", "%")}
+                  {campoManual("Taxa de NC de Qualidade de Produto (%)", "nc_qualidade_pct", "%")}
+                  <button onClick={salvarManual} className="w-full py-3 rounded-lg font-semibold text-sm mt-2" style={{ background: C.gold, color: C.bg }}>Salvar</button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AnaliseFornecedor({ dados }) {
+      const semanas = ordenarSemanas(dados.semanas);
+      const [semanaSel, setSemanaSel] = useState(semanas[semanas.length - 1] || "");
+      const [sortBy, setSortBy] = useState("valor");
+      const [sortDir, setSortDir] = useState("desc");
+      const semana = dados.semanas[semanaSel];
+      const fornecedores = (semana && semana.fornecedores) || [];
+      const totalValor = fornecedores.reduce((s, f) => s + (f.valor || 0), 0);
+      const linhas = useMemo(() => {
+        const arr = fornecedores.map((f) => ({ ...f, concentracao: totalValor > 0 ? ((f.valor || 0) / totalValor) * 100 : 0 }));
+        arr.sort((a, b) => {
+          if (sortBy === "nome") return sortDir === "asc" ? a.nome.localeCompare(b.nome) : b.nome.localeCompare(a.nome);
+          const va = a[sortBy] ?? -Infinity, vb = b[sortBy] ?? -Infinity;
+          return sortDir === "asc" ? va - vb : vb - va;
+        });
+        return arr;
+      }, [fornecedores, totalValor, sortBy, sortDir]);
+      const toggleSort = (col) => { if (sortBy === col) setSortDir(sortDir === "asc" ? "desc" : "asc"); else { setSortBy(col); setSortDir(col === "nome" ? "asc" : "desc"); } };
+      const Th = ({ col, children, align = "left" }) => (
+        <th onClick={() => toggleSort(col)} className="px-3 py-2.5 cursor-pointer select-none text-xs font-medium" style={{ color: C.textSec, textAlign: align }}>
+          {children} {sortBy === col ? (sortDir === "asc" ? "↑" : "↓") : ""}
+        </th>
+      );
+      return (
+        <div className="p-6 overflow-y-auto h-full">
+          <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+            <h1 className="text-xl font-semibold" style={{ color: C.text }}>Análise por Fornecedor</h1>
+            <select value={semanaSel} onChange={(e) => setSemanaSel(e.target.value)} className="px-3 py-2 rounded-lg text-sm outline-none" style={{ background: C.card, color: C.text, border: `1px solid ${C.border}` }}>
+              {semanas.slice().reverse().map((s) => <option key={s} value={s}>{s.replace(/(\d+)-Sem(\d+)/, "Semana $2 · $1")}</option>)}
+            </select>
+          </div>
+          {fornecedores.length === 0 ? (
+            <div className="rounded-xl p-10 text-center" style={{ background: C.card, border: `1px solid ${C.border}`, color: C.textSec }}>Sem dados de fornecedores nesta semana. Faça o upload do relatório 218.</div>
+          ) : (
+            <div className="rounded-xl overflow-hidden" style={{ background: C.card, border: `1px solid ${C.border}` }}>
+              <table className="w-full text-sm" style={{ fontFamily: "'DM Sans', sans-serif" }}>
+                <thead style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <tr>
+                    <Th col="nome">Fornecedor</Th>
+                    <Th col="kg" align="right">Volume (kg)</Th>
+                    <Th col="valor" align="right">Valor Total (R$)</Th>
+                    <Th col="concentracao" align="left">% Concentração</Th>
+                    <Th col="leadMedio" align="right">Lead Time</Th>
+                    <Th col="pontualidade" align="right">Pontualidade</Th>
+                  </tr>
+                </thead>
+                <tbody style={{ fontFamily: "'DM Mono', monospace" }}>
+                  {linhas.map((f, i) => {
+                    const top5 = i < 5 && sortBy === "valor" && sortDir === "desc";
+                    return (
+                      <tr key={f.nome} style={{ borderBottom: `1px solid ${C.border}`, background: top5 ? "rgba(200,169,110,0.04)" : "transparent" }}>
+                        <td className="px-3 py-3" style={{ color: C.text, fontFamily: "'DM Sans', sans-serif" }}>{top5 && <span style={{ color: C.gold }}>★ </span>}{f.nome}</td>
+                        <td className="px-3 py-3 text-right" style={{ color: C.textSec }}>{f.kg ? f.kg.toLocaleString("pt-BR") : "—"}</td>
+                        <td className="px-3 py-3 text-right" style={{ color: C.text }}>{f.valor ? "R$ " + f.valor.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"}</td>
+                        <td className="px-3 py-3" style={{ minWidth: 140 }}>
+                          <div className="flex items-center gap-2">
+                            <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
+                              <div className="h-full rounded-full" style={{ width: `${Math.min(f.concentracao, 100)}%`, background: C.gold }} />
+                            </div>
+                            <span style={{ color: C.textSec, fontSize: 12, minWidth: 42, textAlign: "right" }}>{f.concentracao.toFixed(1)}%</span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-3 text-right" style={{ color: C.textSec }}>{f.leadMedio != null ? f.leadMedio + "d" : "—"}</td>
+                        <td className="px-3 py-3 text-right" style={{ color: C.textSec }}>{f.pontualidade != null ? f.pontualidade + "%" : "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function HistoricoSemanal({ dados, toast }) {
+      const semanas = ordenarSemanas(dados.semanas);
+      const [mesFiltro, setMesFiltro] = useState("todos");
+      const mesesDisponiveis = useMemo(() => {
+        const set = new Set();
+        semanas.forEach((s) => { if (dados.semanas[s].mes) set.add(dados.semanas[s].mes); });
+        return Array.from(set);
+      }, [dados, semanas]);
+      const semanasFiltradas = semanas.filter((s) => mesFiltro === "todos" || dados.semanas[s].mes === mesFiltro);
+      function exportarCSV() {
+        const cabec = ["Semana", "Período", ...KPI_DEFS.map((k) => `${k.nome} (${k.unidade})`)];
+        const linhas = [cabec];
+        semanasFiltradas.forEach((sid) => {
+          const s = dados.semanas[sid];
+          const periodo = s.periodo_inicio ? `${s.periodo_inicio}${s.periodo_fim ? " a " + s.periodo_fim : ""}` : "";
+          const row = [sid, periodo];
+          KPI_DEFS.forEach((k) => { const v = s.kpis ? s.kpis[k.key] : null; row.push(v == null ? "" : String(v).replace(".", ",")); });
+          linhas.push(row);
+        });
+        const csv = linhas.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(";")).join("\n");
+        const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `historico_compras_${mesFiltro}.csv`; a.click();
+        URL.revokeObjectURL(url);
+        toast("✓ CSV exportado");
+      }
+      const bgSem = (key, v) => {
+        const s = semaforo(key, v);
+        if (!s) return "transparent";
+        return s === "verde" ? "rgba(122,184,122,0.13)" : s === "amarelo" ? "rgba(200,166,64,0.13)" : "rgba(200,112,112,0.13)";
+      };
+      return (
+        <div className="p-6 overflow-auto h-full">
+          <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+            <h1 className="text-xl font-semibold" style={{ color: C.text }}>Histórico Semanal</h1>
+            <div className="flex items-center gap-3">
+              <select value={mesFiltro} onChange={(e) => setMesFiltro(e.target.value)} className="px-3 py-2 rounded-lg text-sm outline-none" style={{ background: C.card, color: C.text, border: `1px solid ${C.border}` }}>
+                <option value="todos">Todos os meses</option>
+                {mesesDisponiveis.map((m) => <option key={m} value={m}>{m}</option>)}
+              </select>
+              <button onClick={exportarCSV} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ background: C.gold, color: C.bg }}>⬇ Exportar CSV</button>
+            </div>
+          </div>
+          <div className="rounded-xl overflow-auto" style={{ background: C.card, border: `1px solid ${C.border}`, maxWidth: "100%" }}>
+            <table className="text-xs" style={{ fontFamily: "'DM Mono', monospace", borderCollapse: "collapse", minWidth: 900 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <th className="px-3 py-3 text-left sticky left-0" style={{ color: C.gold, background: C.card, fontFamily: "'DM Sans', sans-serif", minWidth: 90 }}>Semana</th>
+                  {KPI_DEFS.map((k) => <th key={k.key} className="px-2 py-3 text-right" style={{ color: C.textSec, fontFamily: "'DM Sans', sans-serif", minWidth: 90 }}>{k.nome}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {semanasFiltradas.slice().reverse().map((sid) => {
+                  const s = dados.semanas[sid];
+                  return (
+                    <tr key={sid} style={{ borderBottom: `1px solid ${C.border}` }}>
+                      <td className="px-3 py-2.5 sticky left-0" style={{ color: C.text, background: C.card, fontFamily: "'DM Sans', sans-serif" }}>{sid.replace(/\d+-Sem/, "S")}</td>
+                      {KPI_DEFS.map((k) => {
+                        const v = s.kpis ? s.kpis[k.key] : null;
+                        return <td key={k.key} className="px-2 py-2.5 text-right" style={{ color: C.text, background: bgSem(k.key, v) }}>{v == null ? "—" : fmtValor(k.key, v)}</td>;
+                      })}
+                    </tr>
+                  );
+                })}
+                {semanasFiltradas.length === 0 && (
+                  <tr><td colSpan={KPI_DEFS.length + 1} className="px-3 py-8 text-center" style={{ color: C.textSec }}>Nenhuma semana neste filtro.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    function Sidebar({ tela, setTela, dados, drive }) {
+      const semanas = ordenarSemanas(dados.semanas);
+      const ultimaId = semanas[semanas.length - 1];
+      const ultima = ultimaId ? dados.semanas[ultimaId] : null;
+      let ultAtual = "—";
+      if (ultima && ultima.atualizado_em) { const dt = new Date(ultima.atualizado_em); ultAtual = fmtDataBR(dt) + " " + dt.toTimeString().slice(0, 5); }
+      const itens = [["dashboard", "📊", "Dashboard"], ["fornecedor", "🏭", "Por Fornecedor"], ["historico", "📅", "Histórico Semanal"]];
+      const corStatus = drive.status === "ok" ? C.green : drive.status === "erro" ? C.red : drive.status === "enviando" ? C.gold : C.textSec;
+      return (
+        <aside className="w-60 flex-shrink-0 flex flex-col p-4" style={{ background: C.card, borderRight: `1px solid ${C.border}`, fontFamily: "'DM Sans', sans-serif" }}>
+          <div className="mb-6 px-2">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-lg" style={{ color: C.gold }}>◆</span>
+              <span className="font-semibold text-base" style={{ color: C.text }}>Controladoria</span>
+            </div>
+            <p className="text-xs" style={{ color: C.textSec }}>Compras · Diego</p>
+          </div>
+          <nav className="flex flex-col gap-1 flex-1">
+            {itens.map(([k, icon, label]) => (
+              <button key={k} onClick={() => setTela(k)} className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-left"
+                style={{ background: tela === k ? "rgba(200,169,110,0.1)" : "transparent", color: tela === k ? C.gold : C.textSec, border: tela === k ? `1px solid rgba(200,169,110,0.25)` : "1px solid transparent" }}>
+                <span>{icon}</span>{label}
+              </button>
+            ))}
+          </nav>
+          <div className="mt-4 px-3 py-3 rounded-lg" style={{ background: C.bg, border: `1px solid ${C.border}` }}>
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[10px] uppercase tracking-wider" style={{ color: C.textSec }}>☁ Nuvem · Drive</p>
+              <span className="text-[10px]" style={{ color: corStatus }}>● {drive.statusTxt}</span>
+            </div>
+            <div className="flex gap-1.5">
+              <button onClick={drive.onEnviar} title="Enviar dados para a planilha"
+                className="flex-1 text-[11px] py-1.5 rounded-md font-medium"
+                style={{ background: "rgba(200,169,110,0.12)", color: C.gold, border: `1px solid rgba(200,169,110,0.25)` }}>
+                ⬆ Enviar
+              </button>
+              <button onClick={drive.onCarregar} title="Carregar dados da planilha"
+                className="flex-1 text-[11px] py-1.5 rounded-md font-medium"
+                style={{ background: "rgba(110,159,200,0.12)", color: C.blue, border: `1px solid rgba(110,159,200,0.25)` }}>
+                ⬇ Carregar
+              </button>
+            </div>
+            <button onClick={drive.onConfig} className="w-full text-[10px] mt-1.5 py-1" style={{ color: C.textSec }}>
+              ⚙ {getDriveUrl() ? "Reconfigurar URL" : "Configurar URL"}
+            </button>
+          </div>
+          <div className="mt-2 px-3 py-3 rounded-lg" style={{ background: C.bg, border: `1px solid ${C.border}` }}>
+            <p className="text-[10px] uppercase tracking-wider mb-1" style={{ color: C.textSec }}>Última atualização</p>
+            <p className="text-xs" style={{ color: C.text, fontFamily: "'DM Mono', monospace" }}>{ultAtual}</p>
+            <p className="text-[10px] mt-2" style={{ color: C.textSec }}>Café Export · NB/Ubon</p>
+          </div>
+        </aside>
+      );
+    }
+
+    function App() {
+      const [dados, setDados] = useState(() => carregarDados());
+      const [tela, setTela] = useState("dashboard");
+      const [modal, setModal] = useState(false);
+      const [toastMsg, setToastMsg] = useState("");
+      useEffect(() => {
+        const id = "ctrl-compras-fonts";
+        if (!document.getElementById(id)) {
+          const link = document.createElement("link");
+          link.id = id; link.rel = "stylesheet";
+          link.href = "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap";
+          document.head.appendChild(link);
+        }
+        const styleId = "ctrl-compras-anim";
+        if (!document.getElementById(styleId)) {
+          const st = document.createElement("style");
+          st.id = styleId;
+          st.textContent = `@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}`;
+          document.head.appendChild(st);
+        }
+      }, []);
+      function toast(msg) { setToastMsg(msg); setTimeout(() => setToastMsg(""), 3000); }
+
+      // ---- Sincronização com Google Drive ----
+      const [driveStatus, setDriveStatus] = useState("idle"); // idle | enviando | ok | erro
+      const statusTxt = driveStatus === "ok" ? "sincronizado" : driveStatus === "enviando" ? "enviando…" : driveStatus === "erro" ? "erro" : (getDriveUrl() ? "pronto" : "não config.");
+
+      function enviarParaDrive(state, silencioso) {
+        if (!getDriveUrl()) { if (!silencioso) toast("⚙ Configure a URL do Drive primeiro"); return; }
+        setDriveStatus("enviando");
+        enviarDrive(state)
+          .then(() => { setDriveStatus("ok"); if (!silencioso) toast("☁ Enviado para a planilha"); })
+          .catch((e) => { setDriveStatus("erro"); if (!silencioso) toast("✗ " + e.message); });
+      }
+      function configurarDrive() {
+        const atual = getDriveUrl();
+        const url = window.prompt("Cole a URL do app da Web do Apps Script (termina em /exec):", atual);
+        if (url === null) return;
+        const u = url.trim();
+        if (u && !/\/exec$/.test(u)) { toast("✗ A URL deve terminar em /exec"); return; }
+        setDriveUrl(u);
+        toast(u ? "✓ URL do Drive salva" : "URL removida");
+        setDriveStatus("idle");
+      }
+      function carregarDoDrive() {
+        if (!getDriveUrl()) { toast("⚙ Configure a URL do Drive primeiro"); return; }
+        setDriveStatus("enviando");
+        carregarDrive()
+          .then((resp) => {
+            if (!resp || !resp.ok) throw new Error("Resposta inválida do Drive");
+            const semanas = resp.semanas || {};
+            if (!Object.keys(semanas).length) { setDriveStatus("ok"); toast("Planilha sem dados ainda"); return; }
+            setDados((prev) => {
+              const novo = JSON.parse(JSON.stringify(prev));
+              Object.keys(semanas).forEach((sid) => {
+                const r = semanas[sid];
+                const ex = novo.semanas[sid] || {};
+                novo.semanas[sid] = { ...ex, ...r, kpis: { ...(ex.kpis || {}), ...(r.kpis || {}) } };
+              });
+              salvarDados(novo);
+              return novo;
+            });
+            setDriveStatus("ok");
+            toast("⬇ Dados carregados do Drive");
+          })
+          .catch((e) => { setDriveStatus("erro"); toast("✗ " + e.message); });
+      }
+
+      function onSalvar(semanaId, payload) {
+        setDados((prev) => {
+          const novo = JSON.parse(JSON.stringify(prev));
+          const existente = novo.semanas[semanaId] || {};
+          const kpisMerge = { ...(existente.kpis || {}) };
+          if (payload.kpis) Object.entries(payload.kpis).forEach(([k, v]) => { if (v !== undefined) kpisMerge[k] = v; });
+          let mes = existente.mes;
+          const dataRef = parseDataBR(payload.periodo_fim || payload.periodo_inicio || existente.periodo_fim || existente.periodo_inicio);
+          if (dataRef) mes = MESES[dataRef.getMonth()];
+          if (!mes) {
+            const pm = semanaId.match(/(\d+)-Sem(\d+)/);
+            if (pm) { const approx = new Date(Number(pm[1]), 0, 1 + (Number(pm[2]) - 1) * 7); mes = MESES[approx.getMonth()]; }
+          }
+          novo.semanas[semanaId] = {
+            ...existente, ...payload, kpis: kpisMerge, mes,
+            fornecedores: payload.fornecedores !== undefined ? payload.fornecedores : existente.fornecedores || [],
+            fonte_218: payload.fonte_218 !== undefined ? payload.fonte_218 : existente.fonte_218,
+            fonte_217: payload.fonte_217 !== undefined ? payload.fonte_217 : existente.fonte_217,
+            atualizado_em: new Date().toISOString(),
+          };
+          salvarDados(novo);
+          if (getDriveUrl()) enviarParaDrive(novo, true); // auto-envio silencioso
+          return novo;
+        });
+      }
+      return (
+        <div className="flex h-screen w-full overflow-hidden" style={{ background: C.bg }}>
+          <Sidebar tela={tela} setTela={setTela} dados={dados}
+            drive={{ status: driveStatus, statusTxt, onEnviar: () => enviarParaDrive(dados, false), onCarregar: carregarDoDrive, onConfig: configurarDrive }} />
+          <main className="flex-1 overflow-hidden">
+            {tela === "dashboard" && <Dashboard dados={dados} onAtualizar={() => setModal(true)} />}
+            {tela === "fornecedor" && <AnaliseFornecedor dados={dados} />}
+            {tela === "historico" && <HistoricoSemanal dados={dados} toast={toast} />}
+          </main>
+          {modal && <ModalAtualizacao dados={dados} onClose={() => setModal(false)} onSalvar={onSalvar} toast={toast} />}
+          <Toast msg={toastMsg} />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+
+  <!-- Bootstrap: transpila o JSX forçando o runtime CLÁSSICO (sem 'import' de jsx-runtime) -->
+  <script>
+    (function () {
+      try {
+        var code = document.getElementById("appCode").textContent;
+        var out = Babel.transform(code, { presets: [["react", { runtime: "classic" }]] }).code;
+        (0, eval)(out);
+      } catch (e) {
+        document.getElementById("root").innerHTML =
+          '<pre style="color:#C87070;padding:24px;font-family:monospace;white-space:pre-wrap;font-size:13px">Erro ao iniciar a aplicação:\n\n' +
+          (e && e.stack ? e.stack : e.message) + "</pre>";
+        console.error(e);
+      }
+    })();
+  </script>
+</body>
+</html>

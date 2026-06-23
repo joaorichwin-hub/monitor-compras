@@ -176,16 +176,17 @@
       metas: { lead_time_dias: 15, pontualidade_pct: 85, concentracao_top5_pct: 60, urgencia_pct: 10, nc_qualidade_pct: 2, variacao_custo_unitario: 2 },
     };
 
-    const LS_KEY = "ctrl_compras_v1";
+    const LS_KEY = "ctrl_compras_v2"; // v2: começa vazio (sem dados de exemplo)
+    function estadoVazio() { return { semanas: {}, metas: JSON.parse(JSON.stringify(DADOS_EXEMPLO.metas)) }; }
     function carregarDados() {
       try {
         const raw = localStorage.getItem(LS_KEY);
-        if (!raw) { localStorage.setItem(LS_KEY, JSON.stringify(DADOS_EXEMPLO)); return JSON.parse(JSON.stringify(DADOS_EXEMPLO)); }
+        if (!raw) { const v = estadoVazio(); localStorage.setItem(LS_KEY, JSON.stringify(v)); return v; }
         const parsed = JSON.parse(raw);
         if (!parsed.semanas) parsed.semanas = {};
         if (!parsed.metas) parsed.metas = DADOS_EXEMPLO.metas;
         return parsed;
-      } catch (e) { return JSON.parse(JSON.stringify(DADOS_EXEMPLO)); }
+      } catch (e) { return estadoVazio(); }
     }
     function salvarDados(dados) {
       try { localStorage.setItem(LS_KEY, JSON.stringify(dados)); } catch (e) { console.error(e); }

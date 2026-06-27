@@ -199,6 +199,42 @@
     function getDriveUrl() { return localStorage.getItem(DRIVE_URL_KEY) || DRIVE_URL_PADRAO; }
     function setDriveUrl(url) { localStorage.setItem(DRIVE_URL_KEY, url || ""); }
 
+    /* ----------------------- AUTENTICAÇÃO (portão de acesso no navegador) ----------------------- */
+    const AUTH_KEY = "ctrl_compras_auth";
+    const LOGIN_LOG_KEY = "ctrl_compras_logins";
+    // Senhas guardadas como hash SHA-256 (o texto da senha NÃO fica no código).
+    const USUARIOS = [
+      { user: "diego", nome: "Diego", hash: "7b1cb4ca0d087293a21283b483971d2c9978870fe51ee7c145248ed417055729" },
+      { user: "joao", nome: "João Pedro", hash: "412b5df15c316ac32d1666f880eb6644e9da06e99129e3c813058a49236b442d" },
+    ];
+    async function sha256(txt) {
+      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(txt));
+      return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    async function autenticar(user, senha) {
+      const u = USUARIOS.find((x) => x.user === String(user).trim().toLowerCase());
+      if (!u) return null;
+      const h = await sha256(senha);
+      return h === u.hash ? { user: u.user, nome: u.nome } : null;
+    }
+    function getAuth() { try { return JSON.parse(sessionStorage.getItem(AUTH_KEY) || "null"); } catch (e) { return null; } }
+    function setAuth(a) { if (a) sessionStorage.setItem(AUTH_KEY, JSON.stringify(a)); else sessionStorage.removeItem(AUTH_KEY); }
+    function registrarLogin(user) {
+      try {
+        const log = JSON.parse(localStorage.getItem(LOGIN_LOG_KEY) || "[]");
+        log.push({ user, em: new Date().toISOString() });
+        localStorage.setItem(LOGIN_LOG_KEY, JSON.stringify(log.slice(-200)));
+      } catch (e) {}
+    }
+
+    // Data de hoje + semana atual (para o abastecimento)
+    const DIAS_SEMANA = ["domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"];
+    function descricaoHoje() {
+      const d = new Date();
+      const { ano, semana } = isoWeek(d);
+      return { dataBR: fmtDataBR(d), diaSemana: DIAS_SEMANA[d.getDay()], ano, semana, semanaId: `${ano}-Sem${String(semana).padStart(2, "0")}` };
+    }
+
     // Envia o estado completo para a planilha. POST 'no-cors' (text/plain evita preflight).
     function enviarDrive(state) {
       const url = getDriveUrl();
@@ -918,7 +954,7 @@
       );
     }
 
-    function Sidebar({ tela, setTela, dados, drive }) {
+    function Sidebar({ tela, setTela, dados, drive, auth, onSair }) {
       const semanas = ordenarSemanas(dados.semanas);
       const ultimaId = semanas[semanas.length - 1];
       const ultima = ultimaId ? dados.semanas[ultimaId] : null;
@@ -934,6 +970,12 @@
               <span className="font-semibold text-base" style={{ color: C.text }}>Controladoria</span>
             </div>
             <p className="text-xs" style={{ color: C.textSec }}>Compras · Diego</p>
+            {auth && (
+              <div className="flex items-center justify-between mt-3 px-2 py-1.5 rounded-lg" style={{ background: C.bg, border: `1px solid ${C.border}` }}>
+                <span className="text-xs" style={{ color: C.text }}>👤 {auth.nome}</span>
+                <button onClick={onSair} className="text-[11px]" style={{ color: C.textSec }} title="Sair">Sair ⏻</button>
+              </div>
+            )}
           </div>
           <nav className="flex flex-col gap-1 flex-1">
             {itens.map(([k, icon, label]) => (
@@ -973,8 +1015,57 @@
       );
     }
 
+    function Login({ onEntrar }) {
+      const [user, setUser] = useState("");
+      const [senha, setSenha] = useState("");
+      const [erro, setErro] = useState("");
+      const [carregando, setCarregando] = useState(false);
+      async function submit(e) {
+        e.preventDefault();
+        setErro(""); setCarregando(true);
+        let a = null;
+        try { a = await autenticar(user, senha); } catch (err) { setErro("Erro ao validar. Tente de novo."); setCarregando(false); return; }
+        setCarregando(false);
+        if (!a) { setErro("Usuário ou senha inválidos."); return; }
+        onEntrar(a);
+      }
+      return (
+        <div className="flex items-center justify-center h-screen w-full px-4" style={{ background: C.bg, fontFamily: "'DM Sans', sans-serif" }}>
+          <form onSubmit={submit} className="w-full max-w-sm rounded-2xl p-7"
+            style={{ background: C.card, border: `1px solid ${C.border}`, animation: "fadeIn 0.25s ease" }}>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-xl" style={{ color: C.gold }}>◆</span>
+              <span className="font-semibold text-lg" style={{ color: C.text }}>Controladoria</span>
+            </div>
+            <p className="text-xs mb-6" style={{ color: C.textSec }}>Monitor de Compras · Café Export &amp; Ubon</p>
+
+            <label className="text-xs block mb-1.5" style={{ color: C.textSec }}>Usuário</label>
+            <input value={user} onChange={(e) => setUser(e.target.value)} autoFocus autoCapitalize="none"
+              className="w-full px-3 py-2.5 rounded-lg text-sm outline-none mb-4"
+              style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}` }} placeholder="diego" />
+
+            <label className="text-xs block mb-1.5" style={{ color: C.textSec }}>Senha</label>
+            <input type="password" value={senha} onChange={(e) => setSenha(e.target.value)}
+              className="w-full px-3 py-2.5 rounded-lg text-sm outline-none mb-2"
+              style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}` }} placeholder="••••••••" />
+
+            {erro && <p className="text-xs mb-2" style={{ color: C.red }}>{erro}</p>}
+
+            <button type="submit" disabled={carregando}
+              className="w-full py-3 rounded-lg font-semibold text-sm mt-3 transition-opacity"
+              style={{ background: C.gold, color: C.bg, opacity: carregando ? 0.6 : 1 }}>
+              {carregando ? "Entrando…" : "Entrar"}
+            </button>
+            <p className="text-[10px] text-center mt-4" style={{ color: C.textSec }}>Acesso restrito · Café Export · NB/Ubon</p>
+          </form>
+        </div>
+      );
+    }
+
     function App() {
       const [dados, setDados] = useState(() => carregarDados());
+      const [auth, setAuthState] = useState(() => getAuth());
+      const [bannerHoje, setBannerHoje] = useState(true);
       const [tela, setTela] = useState("dashboard");
       const [modal, setModal] = useState(false);
       const [toastMsg, setToastMsg] = useState("");
@@ -995,6 +1086,15 @@
         }
       }, []);
       function toast(msg) { setToastMsg(msg); setTimeout(() => setToastMsg(""), 3000); }
+
+      // ---- Login / logout ----
+      function entrar(a) {
+        const info = { ...a, loginEm: new Date().toISOString() };
+        setAuth(info); registrarLogin(a.user);
+        setAuthState(info); setBannerHoje(true);
+      }
+      function sair() { setAuth(null); setAuthState(null); }
+      const hoje = descricaoHoje();
 
       // ---- Sincronização com Google Drive ----
       const [driveStatus, setDriveStatus] = useState("idle"); // idle | enviando | ok | erro
@@ -1066,14 +1166,33 @@
           return novo;
         });
       }
+      if (!auth) return <Login onEntrar={entrar} />;
+
       return (
         <div className="flex h-screen w-full overflow-hidden" style={{ background: C.bg }}>
-          <Sidebar tela={tela} setTela={setTela} dados={dados}
+          <Sidebar tela={tela} setTela={setTela} dados={dados} auth={auth} onSair={sair}
             drive={{ status: driveStatus, statusTxt, onEnviar: () => enviarParaDrive(dados, false), onCarregar: carregarDoDrive, onConfig: configurarDrive }} />
-          <main className="flex-1 overflow-hidden">
-            {tela === "dashboard" && <Dashboard dados={dados} onAtualizar={() => setModal(true)} />}
-            {tela === "fornecedor" && <AnaliseFornecedor dados={dados} />}
-            {tela === "historico" && <HistoricoSemanal dados={dados} toast={toast} />}
+          <main className="flex-1 overflow-hidden flex flex-col">
+            {bannerHoje && (
+              <div className="flex items-center justify-between gap-3 px-6 py-3 flex-shrink-0"
+                style={{ background: "rgba(200,169,110,0.10)", borderBottom: `1px solid ${C.border}`, fontFamily: "'DM Sans', sans-serif" }}>
+                <p className="text-sm" style={{ color: C.text }}>
+                  👋 Olá, <strong style={{ color: C.gold }}>{auth.nome}</strong>. Hoje é {hoje.diaSemana}, <span style={{ fontFamily: "'DM Mono', monospace" }}>{hoje.dataBR}</span> — você está na <strong style={{ color: C.gold }}>Semana {hoje.semana} de {hoje.ano}</strong>. Abasteça os dados desta semana.
+                </p>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <button onClick={() => setModal(true)} className="px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap"
+                    style={{ background: C.gold, color: C.bg }}>
+                    📤 Abastecer Semana {hoje.semana}
+                  </button>
+                  <button onClick={() => setBannerHoje(false)} className="text-sm px-1" style={{ color: C.textSec }}>✕</button>
+                </div>
+              </div>
+            )}
+            <div className="flex-1 overflow-hidden">
+              {tela === "dashboard" && <Dashboard dados={dados} onAtualizar={() => setModal(true)} />}
+              {tela === "fornecedor" && <AnaliseFornecedor dados={dados} />}
+              {tela === "historico" && <HistoricoSemanal dados={dados} toast={toast} />}
+            </div>
           </main>
           {modal && <ModalAtualizacao dados={dados} onClose={() => setModal(false)} onSalvar={onSalvar} toast={toast} />}
           <Toast msg={toastMsg} />
